@@ -209,7 +209,9 @@ where
             .fees
             .as_ref()
             .map(|f| f.intent_fee.onchain_output)
-            .unwrap_or(Amount::ZERO);
+            .ok_or_else(|| {
+                Error::ad_hoc("server did not provide fee info; cannot determine onchain fee")
+            })?;
 
         // Deduct fee from the requested amount.
         let net_to_amount = to_amount.checked_sub(onchain_fee).ok_or_else(|| {

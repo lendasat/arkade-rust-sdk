@@ -47,6 +47,11 @@ pub struct Client {
     configuration: apis::configuration::Configuration,
 }
 
+pub struct ListVtxosResponse {
+    pub vtxos: Vec<VirtualTxOutPoint>,
+    pub page: Option<IndexerPage>,
+}
+
 impl Client {
     pub fn new(ark_server_url: String) -> Self {
         let configuration = apis::configuration::Configuration {
@@ -146,14 +151,14 @@ impl Client {
         Ok(FinalizeOffchainTxResponse {})
     }
 
-    pub async fn list_vtxos(
-        &self,
-        request: GetVtxosRequest,
-    ) -> Result<Vec<VirtualTxOutPoint>, Error> {
+    pub async fn list_vtxos(&self, request: GetVtxosRequest) -> Result<ListVtxosResponse, Error> {
         let reference = request.reference();
 
         if reference.is_empty() {
-            return Ok(Vec::new());
+            return Ok(ListVtxosResponse {
+                vtxos: Vec::new(),
+                page: None,
+            });
         }
 
         let filter = request.filter();
@@ -167,17 +172,24 @@ impl Client {
                 (None, Some(o.iter().map(|o| o.to_string()).collect()))
             }
         };
-        let (spendable_only, spent_only, recoverable_only) = match filter {
-            None => (Some(false), Some(false), Some(false)),
+        let (spendable_only, spent_only, recoverable_only, pending_only) = match filter {
+            None => (Some(false), Some(false), Some(false), Some(false)),
             Some(filter) => match filter {
-                GetVtxosRequestFilter::Spendable => (Some(true), Some(false), Some(false)),
-                GetVtxosRequestFilter::Spent => (Some(false), Some(true), Some(false)),
-                GetVtxosRequestFilter::Recoverable => (Some(false), Some(false), Some(true)),
+                GetVtxosRequestFilter::Spendable => {
+                    (Some(true), Some(false), Some(false), Some(false))
+                }
+                GetVtxosRequestFilter::Spent => (Some(false), Some(true), Some(false), Some(false)),
+                GetVtxosRequestFilter::Recoverable => {
+                    (Some(false), Some(false), Some(true), Some(false))
+                }
+                GetVtxosRequestFilter::PendingOnly => {
+                    (Some(false), Some(false), Some(false), Some(true))
+                }
             },
         };
 
-        let page_period_size: Option<i32> = None;
-        let page_period_index: Option<i32> = None;
+        let page_period_size: Option<i32> = request.page().map(|p| p.size);
+        let page_period_index: Option<i32> = request.page().map(|p| p.index);
 
         let response = indexer_service_get_vtxos(
             &self.configuration,
@@ -186,6 +198,7 @@ impl Client {
             spendable_only,
             spent_only,
             recoverable_only,
+            pending_only,
             page_period_size,
             page_period_index,
         )
@@ -198,7 +211,13 @@ impl Client {
             .map(VirtualTxOutPoint::try_from)
             .collect::<Result<Vec<_>, crate::conversions::ConversionError>>()?;
 
-        Ok(vtxos)
+        let page = response.page.map(|p| IndexerPage {
+            current: p.current.unwrap_or_default(),
+            next: p.next.unwrap_or_default(),
+            total: p.total.unwrap_or_default(),
+        });
+
+        Ok(ListVtxosResponse { vtxos, page })
     }
 
     pub async fn register_intent(

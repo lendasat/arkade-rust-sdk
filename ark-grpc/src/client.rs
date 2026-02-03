@@ -4,6 +4,7 @@ use crate::generated::ark::v1::get_subscription_response;
 use crate::generated::ark::v1::indexer_service_client::IndexerServiceClient;
 use crate::generated::ark::v1::indexer_tx_history_record::Key;
 use crate::generated::ark::v1::ConfirmRegistrationRequest;
+use crate::generated::ark::v1::EstimateIntentFeeRequest;
 use crate::generated::ark::v1::GetEventStreamRequest;
 use crate::generated::ark::v1::GetInfoRequest;
 use crate::generated::ark::v1::GetSubscriptionRequest;
@@ -109,12 +110,14 @@ impl Client {
         response.into_inner().try_into()
     }
 
-    pub async fn list_vtxos(
-        &self,
-        request: GetVtxosRequest,
-    ) -> Result<Vec<VirtualTxOutPoint>, Error> {
+    /// List VTXOs with pagination support.
+    /// Returns a single page of results along with pagination info.
+    pub async fn list_vtxos(&self, request: GetVtxosRequest) -> Result<ListVtxosResponse, Error> {
         if request.reference().is_empty() {
-            return Ok(Vec::new());
+            return Ok(ListVtxosResponse {
+                vtxos: Vec::new(),
+                page: None,
+            });
         }
 
         let mut client = self.indexer_client()?;
@@ -124,14 +127,21 @@ impl Client {
             .await
             .map_err(Error::request)?;
 
-        let vtxos = response
-            .get_ref()
+        let inner = response.into_inner();
+
+        let vtxos = inner
             .vtxos
             .iter()
             .map(VirtualTxOutPoint::try_from)
             .collect::<Result<Vec<_>, _>>()?;
 
-        Ok(vtxos)
+        let page = inner
+            .page
+            .map(IndexerPage::try_from)
+            .transpose()
+            .map_err(Error::conversion)?;
+
+        Ok(ListVtxosResponse { vtxos, page })
     }
 
     pub async fn register_intent(&self, intent: ark_core::intent::Intent) -> Result<String, Error> {
@@ -523,6 +533,24 @@ impl Client {
         Ok(stream.boxed())
     }
 
+    pub async fn estimate_fees(
+        &self,
+        intent: ark_core::intent::Intent,
+    ) -> Result<SignedAmount, Error> {
+        let mut client = self.ark_client()?;
+
+        let intent = intent.try_into()?;
+        let response = client
+            .estimate_intent_fee(EstimateIntentFeeRequest {
+                intent: Some(intent),
+            })
+            .await
+            .map_err(Error::request)?;
+        let response = response.into_inner();
+
+        Ok(SignedAmount::from_sat(response.fee))
+    }
+
     fn ark_client(&self) -> Result<ArkServiceClient<tonic::transport::Channel>, Error> {
         // Cloning an `ArkServiceClient<Channel>` is cheap.
         self.ark_client.clone().ok_or(Error::not_connected())
@@ -848,6 +876,11 @@ pub struct VtxoChainResponse {
     pub page: Option<IndexerPage>,
 }
 
+pub struct ListVtxosResponse {
+    pub vtxos: Vec<VirtualTxOutPoint>,
+    pub page: Option<IndexerPage>,
+}
+
 impl TryFrom<generated::ark::v1::GetVtxoChainResponse> for VtxoChainResponse {
     type Error = Error;
 
@@ -1037,12 +1070,20 @@ impl TryFrom<generated::ark::v1::GetSubscriptionResponse> for SubscriptionRespon
 
 impl From<GetVtxosRequest> for generated::ark::v1::GetVtxosRequest {
     fn from(value: GetVtxosRequest) -> Self {
-        let (spendable_only, spent_only, recoverable_only) = match value.filter() {
-            Some(GetVtxosRequestFilter::Spendable) => (true, false, false),
-            Some(GetVtxosRequestFilter::Spent) => (false, true, false),
-            Some(GetVtxosRequestFilter::Recoverable) => (false, false, true),
-            None => (false, false, false),
+        let (spendable_only, spent_only, recoverable_only, pending_only) = match value.filter() {
+            Some(GetVtxosRequestFilter::Spendable) => (true, false, false, false),
+            Some(GetVtxosRequestFilter::Spent) => (false, true, false, false),
+            Some(GetVtxosRequestFilter::Recoverable) => (false, false, true, false),
+            Some(GetVtxosRequestFilter::PendingOnly) => (false, false, false, true),
+            None => (false, false, false, false),
         };
+
+        let page = value
+            .page()
+            .map(|p| generated::ark::v1::IndexerPageRequest {
+                size: p.size,
+                index: p.index,
+            });
 
         match value.reference() {
             GetVtxosRequestReference::Scripts(script_bufs) => Self {
@@ -1051,7 +1092,8 @@ impl From<GetVtxosRequest> for generated::ark::v1::GetVtxosRequest {
                 spendable_only,
                 spent_only,
                 recoverable_only,
-                page: None,
+                page,
+                pending_only,
             },
             GetVtxosRequestReference::OutPoints(outpoints) => Self {
                 scripts: Vec::new(),
@@ -1059,7 +1101,8 @@ impl From<GetVtxosRequest> for generated::ark::v1::GetVtxosRequest {
                 spendable_only,
                 spent_only,
                 recoverable_only,
-                page: None,
+                page,
+                pending_only,
             },
         }
     }

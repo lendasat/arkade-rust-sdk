@@ -211,10 +211,20 @@ pub struct TxTreeNode {
     pub leaf: bool,
 }
 
-// TODO: Implement pagination.
+#[derive(Clone)]
 pub struct GetVtxosRequest {
     reference: GetVtxosRequestReference,
     filter: Option<GetVtxosRequestFilter>,
+    page: Option<PageRequest>,
+}
+
+/// Page request for paginated queries.
+#[derive(Debug, Clone, Copy)]
+pub struct PageRequest {
+    /// Number of items per page.
+    pub size: i32,
+    /// Page index (0-based).
+    pub index: i32,
 }
 
 impl GetVtxosRequest {
@@ -226,6 +236,7 @@ impl GetVtxosRequest {
         Self {
             reference: GetVtxosRequestReference::Scripts(scripts),
             filter: None,
+            page: None,
         }
     }
 
@@ -233,6 +244,7 @@ impl GetVtxosRequest {
         Self {
             reference: GetVtxosRequestReference::OutPoints(outpoints.to_vec()),
             filter: None,
+            page: None,
         }
     }
 
@@ -269,6 +281,17 @@ impl GetVtxosRequest {
         })
     }
 
+    pub fn pending_only(self) -> Result<Self, Error> {
+        if self.filter.is_some() {
+            return Err(Error::ad_hoc("GetVtxosRequest filter already set"));
+        }
+
+        Ok(Self {
+            filter: Some(GetVtxosRequestFilter::PendingOnly),
+            ..self
+        })
+    }
+
     pub fn reference(&self) -> &GetVtxosRequestReference {
         &self.reference
     }
@@ -276,8 +299,20 @@ impl GetVtxosRequest {
     pub fn filter(&self) -> Option<&GetVtxosRequestFilter> {
         self.filter.as_ref()
     }
+
+    pub fn with_page(self, size: i32, index: i32) -> Self {
+        Self {
+            page: Some(PageRequest { size, index }),
+            ..self
+        }
+    }
+
+    pub fn page(&self) -> Option<PageRequest> {
+        self.page
+    }
 }
 
+#[derive(Clone)]
 pub enum GetVtxosRequestReference {
     Scripts(Vec<ScriptBuf>),
     OutPoints(Vec<OutPoint>),
@@ -292,10 +327,12 @@ impl GetVtxosRequestReference {
     }
 }
 
+#[derive(Clone, Copy)]
 pub enum GetVtxosRequestFilter {
     Spendable,
     Spent,
     Recoverable,
+    PendingOnly,
 }
 
 #[derive(Clone, Debug, PartialEq)]
@@ -325,6 +362,19 @@ pub struct VirtualTxOutPoint {
 }
 
 impl VirtualTxOutPoint {
+    /// Check if a VTXO is recoverable.
+    ///
+    /// Recoverable VTXOs can be settled, but they cannot be sent in an offchain transaction. To
+    /// settle them, the original VTXO does not need to be forfeited, as the Arkade server already
+    /// controls it.
+    pub fn is_recoverable(&self, dust: Amount) -> bool {
+        if self.is_spent {
+            return false;
+        }
+
+        self.amount < dust || self.is_swept || self.is_expired()
+    }
+
     /// Check if a VTXO has expired.
     ///
     /// Expired VTXOs can be settled, but they cannot be sent in an offchain transaction. To settle
@@ -349,15 +399,6 @@ impl VirtualTxOutPoint {
         };
 
         current_timestamp > self.expires_at && !self.is_swept && !self.is_spent
-    }
-
-    /// Check if a VTXO is recoverable.
-    ///
-    /// Recoverable VTXOs can be settled, but they cannot be sent in an offchain transaction. To
-    /// settle them, the original VTXO does not need to be forfeited, as the Arkade server already
-    /// controls it.
-    pub fn is_recoverable(&self, dust: Amount) -> bool {
-        (self.amount < dust || self.is_swept) && !self.is_spent
     }
 }
 

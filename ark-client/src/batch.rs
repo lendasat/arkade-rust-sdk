@@ -17,6 +17,7 @@ use ark_core::batch::sign_commitment_psbt;
 use ark_core::batch::Delegate;
 use ark_core::batch::NonceKps;
 use ark_core::intent;
+pub use ark_core::intent::IntentMessageType;
 use ark_core::script::extract_checksig_pubkeys;
 use ark_core::server::BatchTreeEventType;
 use ark_core::server::PartialSigTree;
@@ -219,7 +220,9 @@ where
         })?;
 
         let change_amount = total_amount.checked_sub(to_amount).ok_or_else(|| {
-            Error::coin_select("cannot afford to send {to_amount}, only have {total_amount}")
+            Error::coin_select(format!(
+                "cannot afford to send {to_amount}, only have {total_amount}"
+            ))
         })?;
 
         tracing::info!(
@@ -237,6 +240,123 @@ where
             self.join_next_batch(
                 &mut rng.clone(),
                 boarding_inputs.clone(),
+                vtxo_inputs.clone(),
+                BatchOutputType::OffBoard {
+                    to_address: to_address.clone(),
+                    to_amount: net_to_amount,
+                    change_address,
+                    change_amount,
+                },
+            )
+            .await
+        };
+
+        // Joining a batch can fail depending on the timing, so we try a few times.
+        let commitment_txid = join_next_batch
+            .retry(ExponentialBuilder::default().with_max_times(3))
+            .sleep(sleep)
+            // TODO: Use `when` to only retry certain errors.
+            .notify(|err: &Error, dur: std::time::Duration| {
+                tracing::warn!("Retrying joining next batch after {dur:?}. Error: {err}");
+            })
+            .await
+            .context("Failed to join batch")?;
+
+        tracing::info!(%commitment_txid, "Collaborative redeem success");
+
+        Ok(commitment_txid)
+    }
+
+    /// Settle a selection of VTXOs into the next batch, generating UTXOs as
+    /// outputs to a new commitment transaction.
+    pub async fn collaborative_redeem_vtxo_selection<R>(
+        &self,
+        rng: &mut R,
+        input_vtxos: impl Iterator<Item = OutPoint> + Clone,
+        to_address: Address,
+        to_amount: Amount,
+    ) -> Result<Txid, Error>
+    where
+        R: Rng + CryptoRng + Clone,
+    {
+        let (change_address, _) = self.get_offchain_address()?;
+
+        let (vtxo_list, script_pubkey_to_vtxo_map) =
+            self.list_vtxos().await.context("failed to get VTXO list")?;
+
+        let vtxo_inputs = vtxo_list
+            .all_unspent()
+            .filter(|v| input_vtxos.clone().any(|outpoint| outpoint == v.outpoint))
+            .map(|v| {
+                let vtxo = script_pubkey_to_vtxo_map.get(&v.script).ok_or_else(|| {
+                    ark_core::Error::ad_hoc(format!("missing VTXO for script pubkey: {}", v.script))
+                })?;
+                let spend_info = vtxo.forfeit_spend_info()?;
+
+                Ok(intent::Input::new(
+                    v.outpoint,
+                    vtxo.exit_delay(),
+                    // NOTE: This only works with default VTXOs (single-sig).
+                    None,
+                    TxOut {
+                        value: v.amount,
+                        script_pubkey: vtxo.script_pubkey(),
+                    },
+                    vtxo.tapscripts(),
+                    spend_info,
+                    false,
+                    v.is_swept,
+                ))
+            })
+            .collect::<Result<Vec<_>, Error>>()?;
+
+        if vtxo_inputs.is_empty() {
+            return Err(Error::ad_hoc("no matching VTXO outpoints found"));
+        }
+
+        // Check that total amount is sufficient
+        let total_input_amount = vtxo_inputs
+            .iter()
+            .fold(Amount::ZERO, |acc, vtxo| acc + vtxo.amount());
+
+        let onchain_fee = self
+            .server_info
+            .fees
+            .as_ref()
+            .map(|f| f.intent_fee.onchain_output)
+            .unwrap_or(Amount::ZERO);
+
+        // Deduct fee from the requested amount.
+        let net_to_amount = to_amount.checked_sub(onchain_fee).ok_or_else(|| {
+            Error::coin_select(
+                "cannot deduct fees from offboard amount ({onchain_fee} > {to_amount})",
+            )
+        })?;
+
+        // Check that inputs can cover output + fee.
+        let change_amount = total_input_amount
+            .checked_sub(to_amount)
+            .and_then(|a| a.checked_sub(onchain_fee))
+            .ok_or_else(|| {
+                Error::coin_select(format!(
+                "insufficient VTXO amount: {total_input_amount} (input) < {to_amount} (to_amount) + {onchain_fee} (fee)",
+            ))
+            })?;
+
+        tracing::info!(
+            %to_address,
+            gross_amount = %to_amount,
+            net_amount = %net_to_amount,
+            fee = %onchain_fee,
+            change_address = %change_address.encode(),
+            %change_amount,
+            "Attempting to collaboratively redeem outputs"
+        );
+
+        let join_next_batch = || async {
+            self.join_next_batch(
+                &mut rng.clone(),
+                Vec::new(),
                 vtxo_inputs.clone(),
                 BatchOutputType::OffBoard {
                     to_address: to_address.clone(),
@@ -803,7 +923,7 @@ where
 
     /// Get all the [`batch::OnChainInput`]s and [`batch::VtxoInput`]s that can be used to join an
     /// upcoming batch.
-    async fn fetch_commitment_transaction_inputs(
+    pub(crate) async fn fetch_commitment_transaction_inputs(
         &self,
     ) -> Result<(Vec<batch::OnChainInput>, Vec<intent::Input>, Amount), Error> {
         // Get all known boarding outputs.
@@ -896,29 +1016,30 @@ where
         Ok((boarding_inputs, vtxo_inputs, total_amount))
     }
 
-    pub(crate) async fn join_next_batch<R>(
+    /// Prepare an intent for batch registration or fee estimation.
+    ///
+    /// This creates a signed intent PSBT along with all the data needed to participate
+    /// in the batch protocol.
+    ///
+    /// The `intent_message_type` parameter determines the intent message type sent to the server.
+    pub(crate) fn prepare_intent<R>(
         &self,
         rng: &mut R,
         onchain_inputs: Vec<batch::OnChainInput>,
         vtxo_inputs: Vec<intent::Input>,
         output_type: BatchOutputType,
-    ) -> Result<Txid, Error>
+        intent_message_type: IntentMessageType,
+    ) -> Result<PreparedIntent, Error>
     where
         R: Rng + CryptoRng,
     {
         if onchain_inputs.is_empty() && vtxo_inputs.is_empty() {
-            return Err(Error::ad_hoc("cannot join batch without inputs"));
+            return Err(Error::ad_hoc("cannot prepare intent without inputs"));
         }
 
-        let server_info = &self.server_info;
-
         // Generate an (ephemeral) cosigner keypair.
-        let own_cosigner_kp = Keypair::new(self.secp(), rng);
+        let cosigner_keypair = Keypair::new(self.secp(), rng);
 
-        let onchain_input_outpoints = onchain_inputs
-            .iter()
-            .map(|i| i.outpoint())
-            .collect::<Vec<_>>();
         let vtxo_input_outpoints = vtxo_inputs.iter().map(|i| i.outpoint()).collect::<Vec<_>>();
 
         let inputs = {
@@ -998,13 +1119,7 @@ where
             }
         }
 
-        let mut step = Step::Start;
-
-        let own_cosigner_kps = [own_cosigner_kp];
-        let own_cosigner_pks = own_cosigner_kps
-            .iter()
-            .map(|k| k.public_key())
-            .collect::<Vec<_>>();
+        let cosigner_pk = cosigner_keypair.public_key();
 
         let secp = Secp256k1::new();
 
@@ -1061,8 +1176,63 @@ where
             sign_for_onchain_fn,
             inputs,
             outputs.clone(),
-            own_cosigner_pks.clone(),
+            vec![cosigner_pk],
+            intent_message_type,
         )?;
+
+        Ok(PreparedIntent {
+            intent,
+            cosigner_keypair,
+            vtxo_input_outpoints,
+            outputs,
+            onchain_inputs,
+            vtxo_inputs,
+        })
+    }
+
+    pub(crate) async fn join_next_batch<R>(
+        &self,
+        rng: &mut R,
+        onchain_inputs: Vec<batch::OnChainInput>,
+        vtxo_inputs: Vec<intent::Input>,
+        output_type: BatchOutputType,
+    ) -> Result<Txid, Error>
+    where
+        R: Rng + CryptoRng,
+    {
+        let prepared = self.prepare_intent(
+            rng,
+            onchain_inputs,
+            vtxo_inputs,
+            output_type,
+            IntentMessageType::Register,
+        )?;
+
+        let PreparedIntent {
+            intent,
+            cosigner_keypair,
+            vtxo_input_outpoints,
+            outputs,
+            onchain_inputs,
+            vtxo_inputs,
+        } = prepared;
+
+        let onchain_input_outpoints = onchain_inputs
+            .iter()
+            .map(|i| i.outpoint())
+            .collect::<Vec<_>>();
+
+        let server_info = &self.server_info;
+
+        let own_cosigner_kps = [cosigner_keypair];
+        let own_cosigner_pks = own_cosigner_kps
+            .iter()
+            .map(|k| k.public_key())
+            .collect::<Vec<_>>();
+
+        let secp = Secp256k1::new();
+
+        let mut step = Step::Start;
 
         let intent_id = timeout_op(
             self.inner.timeout,
@@ -1544,7 +1714,7 @@ where
     }
 }
 
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub(crate) enum BatchOutputType {
     Board {
         to_address: ArkAddress,
@@ -1556,4 +1726,20 @@ pub(crate) enum BatchOutputType {
         change_address: ArkAddress,
         change_amount: Amount,
     },
+}
+
+/// Prepared intent data ready for batch registration.
+pub(crate) struct PreparedIntent {
+    /// The signed intent.
+    pub intent: intent::Intent,
+    /// The ephemeral cosigner keypair.
+    pub cosigner_keypair: Keypair,
+    /// VTXO input outpoints (used for event stream topics).
+    pub vtxo_input_outpoints: Vec<OutPoint>,
+    /// Intent outputs (used to determine batch protocol steps).
+    pub outputs: Vec<intent::Output>,
+    /// The original onchain inputs (needed for commitment signing).
+    pub onchain_inputs: Vec<batch::OnChainInput>,
+    /// The original VTXO inputs (needed for forfeit signing).
+    pub vtxo_inputs: Vec<intent::Input>,
 }

@@ -10,8 +10,10 @@ use anyhow::Context;
 use anyhow::Result;
 use ark_bdk_wallet::Wallet;
 use ark_client::lightning_invoice::Bolt11Invoice;
+use ark_client::Bip32KeyProvider;
 use ark_client::Blockchain;
 use ark_client::Error;
+use ark_client::KeyProvider;
 use ark_client::OfflineClient;
 use ark_client::SpendStatus;
 use ark_client::SqliteSwapStorage;
@@ -21,8 +23,11 @@ use ark_client::TxStatus;
 use ark_core::history;
 use ark_core::server::SubscriptionResponse;
 use ark_core::ArkAddress;
+use ark_core::ArkNote;
 use ark_core::ExplorerUtxo;
+use ark_grpc::test_utils as grpc_test_utils;
 use bitcoin::address::NetworkUnchecked;
+use bitcoin::bip32::Xpriv;
 use bitcoin::key::Secp256k1;
 use bitcoin::secp256k1::SecretKey;
 use bitcoin::Address;
@@ -55,9 +60,13 @@ struct Cli {
     #[arg(short, long, default_value = "ark.config.toml")]
     config: String,
 
-    /// Path to the seed file.
-    #[arg(short, long, default_value = "ark.seed")]
-    seed: String,
+    /// Path to a BIP39 mnemonic file.
+    #[arg(short, long)]
+    mnemonic: Option<String>,
+
+    /// Path to a hex-encoded secret key file.
+    #[arg(short, long)]
+    seed: Option<String>,
 
     #[command(subcommand)]
     command: Commands,
@@ -89,7 +98,11 @@ enum Commands {
         amount: u64,
     },
     /// Transform boarding outputs and VTXOs into fresh, confirmed VTXOs.
-    Settle,
+    Settle {
+        /// ArkNote strings to include in the settlement (comma-separated).
+        #[arg(long)]
+        notes: Option<String>,
+    },
     /// Subscribe to notifications for an Ark address.
     Subscribe {
         /// The Ark address to subscribe to.
@@ -143,6 +156,23 @@ enum Commands {
         address: String,
         /// How many sats to send.
         amount: Option<u64>,
+    },
+    /// List pending (submitted but not finalized) offchain transactions.
+    ListPendingTxs,
+    /// Continue and finalize any pending offchain transactions.
+    ContinuePendingTxs,
+    /// Submit an offchain tx WITHOUT finalizing (for testing pending tx recovery).
+    SubmitOnly { address: ArkAddressCli, amount: u64 },
+    /// Create ArkNotes via the admin API (regtest only).
+    CreateNote {
+        /// Amount in satoshis for each note.
+        amount: u64,
+        /// Number of notes to create (default: 1).
+        #[arg(short, long, default_value = "1")]
+        quantity: u32,
+        /// Admin API URL (default: http://localhost:7071).
+        #[arg(long, default_value = "http://localhost:7071")]
+        admin_url: String,
     },
 }
 
@@ -217,6 +247,19 @@ struct ListVtxosOutput {
     boarding_outputs: Vec<BoardingEntry>,
 }
 
+#[derive(Serialize)]
+struct PendingTxEntry {
+    ark_txid: String,
+    num_inputs: usize,
+    num_outputs: usize,
+    total_output_sats: u64,
+}
+
+#[derive(Serialize)]
+struct ListPendingTxsOutput {
+    pending_txs: Vec<PendingTxEntry>,
+}
+
 fn format_timestamp(unix_secs: i64) -> Result<String> {
     let ts = Timestamp::from_second(unix_secs)?;
     Ok(ts.to_string())
@@ -232,18 +275,36 @@ async fn main() -> Result<()> {
         .map_err(|_| anyhow!("failed to install crypto providers"))?;
 
     let cli = Cli::parse();
+
+    // Handle CreateNote early - it doesn't need a wallet or config
+    if let Commands::CreateNote {
+        amount,
+        quantity,
+        admin_url,
+    } = &cli.command
+    {
+        let notes = grpc_test_utils::create_notes_with_url(admin_url, *amount as u32, *quantity)
+            .await
+            .map_err(|e| anyhow!("failed to create notes: {e}"))?;
+
+        let output: Vec<_> = notes
+            .iter()
+            .map(|note| {
+                serde_json::json!({
+                    "note": note.to_encoded_string(),
+                    "value_sats": note.value().to_sat(),
+                })
+            })
+            .collect();
+
+        println!("{}", serde_json::to_string_pretty(&output)?);
+        return Ok(());
+    }
+
     let secp = Secp256k1::new();
 
-    let seed = fs::read_to_string(cli.seed)?;
-    let sk = SecretKey::from_str(&seed)?;
-    let kp = sk.keypair(&secp);
-
-    let config = fs::read_to_string(cli.config)?;
+    let config = fs::read_to_string(&cli.config)?;
     let config: Config = toml::from_str(&config)?;
-
-    let db = InMemoryDb::default();
-    let wallet = Wallet::new(kp, secp, Network::Regtest, config.esplora_url.as_str(), db)?;
-    let wallet = Arc::new(wallet);
 
     let esplora_client = EsploraClient::new(&config.esplora_url)?;
     let esplora_client = Arc::new(esplora_client);
@@ -253,21 +314,82 @@ async fn main() -> Result<()> {
             .await
             .map_err(|e| anyhow!(e))?,
     );
-    let client = OfflineClient::<_, _, _, StaticKeyProvider>::new_with_keypair(
-        "sample-client".to_string(),
-        kp,
-        esplora_client.clone(),
-        wallet,
-        config.ark_server_url,
-        storage,
-        config.boltz_url,
-        Duration::from_secs(30),
-    )
-    .connect()
-    .await
-    .map_err(|e| anyhow!(e))?;
 
-    match &cli.command {
+    match (cli.mnemonic, cli.seed) {
+        (Some(_), Some(_)) => bail!("specify either --mnemonic or --seed, not both"),
+        (None, None) => bail!("specify either --mnemonic or --seed"),
+        (Some(mnemonic_path), None) => {
+            let mnemonic_str = fs::read_to_string(mnemonic_path)?;
+            let mnemonic = bip39::Mnemonic::parse_normalized(mnemonic_str.trim())
+                .map_err(|e| anyhow!("invalid mnemonic: {e}"))?;
+            let seed = mnemonic.to_seed("");
+            let xpriv = Xpriv::new_master(Network::Regtest, &seed)?;
+
+            let db = InMemoryDb::default();
+            let wallet = Wallet::new_from_xpriv(
+                xpriv,
+                secp,
+                Network::Regtest,
+                config.esplora_url.as_str(),
+                db,
+            )?;
+            let wallet = Arc::new(wallet);
+
+            let client = OfflineClient::<_, _, _, Bip32KeyProvider>::new_with_bip32(
+                "sample-client".to_string(),
+                xpriv,
+                None,
+                esplora_client.clone(),
+                wallet,
+                config.ark_server_url,
+                storage,
+                config.boltz_url,
+                Duration::from_secs(30),
+            )
+            .connect()
+            .await
+            .map_err(|e| anyhow!(e))?;
+
+            run_command(cli.command, client, esplora_client).await?;
+        }
+        (None, Some(seed_path)) => {
+            let seed = fs::read_to_string(seed_path)?;
+            let sk = SecretKey::from_str(seed.trim())?;
+            let kp = sk.keypair(&secp);
+
+            let db = InMemoryDb::default();
+            let wallet = Wallet::new(kp, secp, Network::Regtest, config.esplora_url.as_str(), db)?;
+            let wallet = Arc::new(wallet);
+
+            let client = OfflineClient::<_, _, _, StaticKeyProvider>::new_with_keypair(
+                "sample-client".to_string(),
+                kp,
+                esplora_client.clone(),
+                wallet,
+                config.ark_server_url,
+                storage,
+                config.boltz_url,
+                Duration::from_secs(30),
+            )
+            .connect()
+            .await
+            .map_err(|e| anyhow!(e))?;
+
+            run_command(cli.command, client, esplora_client).await?;
+        }
+    }
+
+    Ok(())
+}
+
+async fn run_command<K: KeyProvider>(
+    command: Commands,
+    client: ark_client::Client<EsploraClient, Wallet<InMemoryDb>, SqliteSwapStorage, K>,
+    esplora_client: Arc<EsploraClient>,
+) -> Result<()> {
+    client.discover_keys(20).await.map_err(|e| anyhow!(e))?;
+
+    match &command {
         Commands::Balance => {
             let offchain_balance = client.offchain_balance().await.map_err(|e| anyhow!(e))?;
 
@@ -314,12 +436,42 @@ async fn main() -> Result<()> {
             let address = address.encode();
             println!("{}", serde_json::json!({"address": address}));
         }
-        Commands::Settle => {
+        Commands::Settle { notes } => {
             let mut rng = thread_rng();
             // we need to call this because how our wallet works
             let _ = client.get_boarding_address();
 
-            let maybe_batch_tx = client.settle(&mut rng).await.map_err(|e| anyhow!(e))?;
+            let maybe_batch_tx = match notes {
+                Some(notes_str) => {
+                    // Parse comma-separated ArkNote strings
+                    let parsed_notes: Vec<ArkNote> = notes_str
+                        .split(',')
+                        .map(|s| {
+                            ArkNote::from_string(s.trim())
+                                .with_context(|| format!("invalid ArkNote: {s}"))
+                        })
+                        .collect::<Result<Vec<_>>>()?;
+
+                    if parsed_notes.is_empty() {
+                        bail!("No valid ArkNotes provided");
+                    }
+
+                    let total_note_value: u64 =
+                        parsed_notes.iter().map(|n| n.value().to_sat()).sum();
+                    tracing::info!(
+                        num_notes = parsed_notes.len(),
+                        total_value = total_note_value,
+                        "Settling with ArkNotes"
+                    );
+
+                    client
+                        .settle_with_notes(&mut rng, parsed_notes)
+                        .await
+                        .map_err(|e| anyhow!(e))?
+                }
+                None => client.settle(&mut rng).await.map_err(|e| anyhow!(e))?,
+            };
+
             match maybe_batch_tx {
                 None => {
                     tracing::info!("No batch transaction - maybe nothing to settle");
@@ -712,6 +864,121 @@ async fn main() -> Result<()> {
                 });
                 println!("{}", serde_json::to_string_pretty(&output)?);
             }
+        }
+        Commands::ListPendingTxs => {
+            let pending_txs = client
+                .list_pending_offchain_txs()
+                .await
+                .map_err(|e| anyhow!(e))?;
+
+            let entries: Vec<PendingTxEntry> = pending_txs
+                .iter()
+                .map(|tx| {
+                    let total_output_sats = tx
+                        .signed_ark_tx
+                        .unsigned_tx
+                        .output
+                        .iter()
+                        .map(|o| o.value.to_sat())
+                        .sum();
+
+                    PendingTxEntry {
+                        ark_txid: tx.ark_txid.to_string(),
+                        num_inputs: tx.signed_ark_tx.unsigned_tx.input.len(),
+                        num_outputs: tx.signed_ark_tx.unsigned_tx.output.len(),
+                        total_output_sats,
+                    }
+                })
+                .collect();
+
+            let output = ListPendingTxsOutput {
+                pending_txs: entries,
+            };
+            println!("{}", serde_json::to_string_pretty(&output)?);
+        }
+        Commands::SubmitOnly { address, amount } => {
+            let amount = Amount::from_sat(*amount);
+
+            let (vtxo_list, script_pubkey_to_vtxo_map) =
+                client.list_vtxos().await.map_err(|e| anyhow!(e))?;
+
+            let spendable = vtxo_list
+                .spendable_offchain()
+                .map(|vtxo| ark_core::coin_select::VirtualTxOutPoint {
+                    outpoint: vtxo.outpoint,
+                    script_pubkey: vtxo.script.clone(),
+                    expire_at: vtxo.expires_at,
+                    amount: vtxo.amount,
+                })
+                .collect::<Vec<_>>();
+
+            let selected = ark_core::coin_select::select_vtxos(
+                spendable,
+                amount,
+                client.server_info.dust,
+                true,
+            )
+            .map_err(|e| anyhow!(e))?;
+
+            let vtxo_inputs: Vec<ark_core::send::VtxoInput> = selected
+                .into_iter()
+                .map(|coin| {
+                    let vtxo = script_pubkey_to_vtxo_map
+                        .get(&coin.script_pubkey)
+                        .ok_or_else(|| {
+                            anyhow!("missing VTXO for script pubkey: {}", coin.script_pubkey)
+                        })?;
+                    let (forfeit_script, control_block) = vtxo
+                        .forfeit_spend_info()
+                        .context("failed to get forfeit spend info")?;
+                    Ok(ark_core::send::VtxoInput::new(
+                        forfeit_script,
+                        None,
+                        control_block,
+                        vtxo.tapscripts(),
+                        vtxo.script_pubkey(),
+                        coin.amount,
+                        coin.outpoint,
+                    ))
+                })
+                .collect::<Result<Vec<_>>>()?;
+
+            let ark_txid = client
+                .submit_offchain_tx(vtxo_inputs, address.0, amount)
+                .await
+                .map_err(|e| anyhow!(e))?;
+
+            tracing::info!(%ark_txid, "Submitted offchain tx WITHOUT finalizing");
+            println!(
+                "{}",
+                serde_json::to_string_pretty(&serde_json::json!({
+                    "ark_txid": ark_txid.to_string(),
+                    "status": "submitted_not_finalized"
+                }))?
+            );
+        }
+        Commands::ContinuePendingTxs => {
+            let finalized = client
+                .continue_pending_offchain_txs()
+                .await
+                .map_err(|e| anyhow!(e))?;
+
+            if finalized.is_empty() {
+                let output = serde_json::json!({
+                    "finalized_txids": [],
+                    "message": "No pending transactions to finalize"
+                });
+                println!("{}", serde_json::to_string_pretty(&output)?);
+            } else {
+                let output = serde_json::json!({
+                    "finalized_txids": finalized.iter().map(|t| t.to_string()).collect::<Vec<_>>()
+                });
+                println!("{}", serde_json::to_string_pretty(&output)?);
+            }
+        }
+        Commands::CreateNote { .. } => {
+            // Handled in main() before client setup
+            unreachable!("CreateNote is handled before client initialization");
         }
     }
 

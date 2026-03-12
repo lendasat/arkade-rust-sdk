@@ -390,13 +390,7 @@ impl VirtualTxOutPoint {
             .as_secs() as i64;
 
         #[cfg(all(target_arch = "wasm32", target_os = "unknown"))]
-        let current_timestamp = {
-            let window = web_sys::window().expect("should have a window in this context");
-            let performance = window
-                .performance()
-                .expect("performance should be available");
-            performance.now() as i64
-        };
+        let current_timestamp = (js_sys::Date::now() / 1000.0) as i64;
 
         current_timestamp > self.expires_at && !self.is_swept && !self.is_spent
     }
@@ -433,12 +427,15 @@ pub struct FeeInfo {
 }
 
 /// Intent fee information.
+///
+/// These are CEL like programs which need to be evaluated during runtime. See [`ark-fees`] module
+/// for details.
 #[derive(Clone, Debug, Default)]
 pub struct IntentFeeInfo {
-    pub offchain_input: Amount,
-    pub offchain_output: Amount,
-    pub onchain_input: Amount,
-    pub onchain_output: Amount,
+    pub offchain_input: Option<String>,
+    pub offchain_output: Option<String>,
+    pub onchain_input: Option<String>,
+    pub onchain_output: Option<String>,
 }
 
 #[derive(Clone, Debug)]
@@ -613,6 +610,13 @@ pub enum ChainedTxType {
 }
 
 pub struct SubmitOffchainTxResponse {
+    pub signed_ark_tx: Psbt,
+    pub signed_checkpoint_txs: Vec<Psbt>,
+}
+
+#[derive(Debug, Clone)]
+pub struct PendingTx {
+    pub ark_txid: Txid,
     pub signed_ark_tx: Psbt,
     pub signed_checkpoint_txs: Vec<Psbt>,
 }

@@ -17,12 +17,12 @@ use ark_core::batch::sign_commitment_psbt;
 use ark_core::batch::Delegate;
 use ark_core::batch::NonceKps;
 use ark_core::intent;
-pub use ark_core::intent::IntentMessageType;
 use ark_core::script::extract_checksig_pubkeys;
 use ark_core::server::BatchTreeEventType;
 use ark_core::server::PartialSigTree;
 use ark_core::server::StreamEvent;
 use ark_core::ArkAddress;
+use ark_core::ArkNote;
 use ark_core::ExplorerUtxo;
 use ark_core::TxGraph;
 use backon::ExponentialBuilder;
@@ -105,6 +105,78 @@ where
             .context("Failed to join batch")?;
 
         tracing::info!(%commitment_txid, "Settlement success");
+
+        Ok(Some(commitment_txid))
+    }
+
+    /// Settle _all_ prior VTXOs, boarding outputs, and the provided ArkNotes into the next batch.
+    ///
+    /// ArkNotes are bearer tokens that can be redeemed by revealing their preimage.
+    /// This method combines them with regular VTXOs and boarding outputs into a single
+    /// settlement transaction.
+    pub async fn settle_with_notes<R>(
+        &self,
+        rng: &mut R,
+        notes: Vec<ArkNote>,
+    ) -> Result<Option<Txid>, Error>
+    where
+        R: Rng + CryptoRng + Clone,
+    {
+        let (to_address, _) = self.get_offchain_address()?;
+
+        let (boarding_inputs, vtxo_inputs, mut total_amount) =
+            self.fetch_commitment_transaction_inputs().await?;
+
+        // Convert arknotes to intent inputs and add their value to total
+        let note_inputs: Vec<intent::Input> = notes
+            .iter()
+            .map(|note| {
+                total_amount += note.value();
+                note.to_intent_input()
+            })
+            .collect::<Result<Vec<_>, _>>()?;
+
+        // Combine VTXO inputs with note inputs
+        let all_vtxo_inputs: Vec<intent::Input> =
+            vtxo_inputs.into_iter().chain(note_inputs).collect();
+
+        tracing::debug!(
+            offchain_address = %to_address.encode(),
+            ?boarding_inputs,
+            num_vtxo_inputs = all_vtxo_inputs.len(),
+            num_notes = notes.len(),
+            %total_amount,
+            "Attempting to settle outputs with notes"
+        );
+
+        if boarding_inputs.is_empty() && all_vtxo_inputs.is_empty() {
+            tracing::debug!("No inputs to settle");
+            return Ok(None);
+        }
+
+        let join_next_batch = || async {
+            self.join_next_batch(
+                &mut rng.clone(),
+                boarding_inputs.clone(),
+                all_vtxo_inputs.clone(),
+                BatchOutputType::Board {
+                    to_address,
+                    to_amount: total_amount,
+                },
+            )
+            .await
+        };
+
+        let commitment_txid = join_next_batch
+            .retry(ExponentialBuilder::default().with_max_times(0))
+            .sleep(sleep)
+            .notify(|err: &Error, dur: std::time::Duration| {
+                tracing::warn!("Retrying joining next batch after {dur:?}. Error: {err}");
+            })
+            .await
+            .context("Failed to join batch")?;
+
+        tracing::info!(%commitment_txid, num_notes = notes.len(), "Settlement with notes success");
 
         Ok(Some(commitment_txid))
     }
@@ -206,11 +278,13 @@ where
             self.fetch_commitment_transaction_inputs().await?;
 
         let onchain_fee = self
-            .server_info
-            .fees
-            .as_ref()
-            .map(|f| f.intent_fee.onchain_output)
-            .unwrap_or(Amount::ZERO);
+            .fee_estimator
+            .eval_onchain_output(ark_fees::Output {
+                amount: to_amount.to_sat(),
+                script: to_address.script_pubkey().to_string(),
+            })
+            .map_err(Error::ad_hoc)?;
+        let onchain_fee = Amount::from_sat(onchain_fee.to_satoshis());
 
         // Deduct fee from the requested amount.
         let net_to_amount = to_amount.checked_sub(onchain_fee).ok_or_else(|| {
@@ -320,11 +394,13 @@ where
             .fold(Amount::ZERO, |acc, vtxo| acc + vtxo.amount());
 
         let onchain_fee = self
-            .server_info
-            .fees
-            .as_ref()
-            .map(|f| f.intent_fee.onchain_output)
-            .unwrap_or(Amount::ZERO);
+            .fee_estimator
+            .eval_onchain_output(ark_fees::Output {
+                amount: to_amount.to_sat(),
+                script: to_address.script_pubkey().to_string(),
+            })
+            .map_err(Error::ad_hoc)?;
+        let onchain_fee = Amount::from_sat(onchain_fee.to_satoshis());
 
         // Deduct fee from the requested amount.
         let net_to_amount = to_amount.checked_sub(onchain_fee).ok_or_else(|| {
@@ -1020,15 +1096,13 @@ where
     ///
     /// This creates a signed intent PSBT along with all the data needed to participate
     /// in the batch protocol.
-    ///
-    /// The `intent_message_type` parameter determines the intent message type sent to the server.
     pub(crate) fn prepare_intent<R>(
         &self,
         rng: &mut R,
         onchain_inputs: Vec<batch::OnChainInput>,
         vtxo_inputs: Vec<intent::Input>,
         output_type: BatchOutputType,
-        intent_message_type: IntentMessageType,
+        intent_kind: PrepareIntentKind,
     ) -> Result<PreparedIntent, Error>
     where
         R: Rng + CryptoRng,
@@ -1171,13 +1245,41 @@ where
                 Ok((sig, owner_pk))
             };
 
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map_err(|e| Error::ad_hoc(e.to_string()))
+            .context("failed to compute now timestamp")?;
+        let now = now.as_secs();
+        let expire_at = now + (2 * 60);
+
+        let mut onchain_output_indexes = Vec::new();
+        for (i, output) in outputs.iter().enumerate() {
+            if matches!(output, intent::Output::Onchain(_)) {
+                onchain_output_indexes.push(i);
+            }
+        }
+
+        let message = match intent_kind {
+            PrepareIntentKind::EstimateFee => intent::IntentMessage::EstimateIntentFee {
+                onchain_output_indexes,
+                valid_at: now,
+                expire_at,
+                own_cosigner_pks: vec![cosigner_pk],
+            },
+            PrepareIntentKind::Register => intent::IntentMessage::Register {
+                onchain_output_indexes,
+                valid_at: now,
+                expire_at,
+                own_cosigner_pks: vec![cosigner_pk],
+            },
+        };
+
         let intent = intent::make_intent(
             sign_for_vtxo_fn,
             sign_for_onchain_fn,
             inputs,
             outputs.clone(),
-            vec![cosigner_pk],
-            intent_message_type,
+            message,
         )?;
 
         Ok(PreparedIntent {
@@ -1205,7 +1307,7 @@ where
             onchain_inputs,
             vtxo_inputs,
             output_type,
-            IntentMessageType::Register,
+            PrepareIntentKind::Register,
         )?;
 
         let PreparedIntent {
@@ -1712,6 +1814,12 @@ where
             }
         }
     }
+}
+
+#[derive(Debug, Clone)]
+pub(crate) enum PrepareIntentKind {
+    Register,
+    EstimateFee,
 }
 
 #[derive(Debug, Clone)]

@@ -287,6 +287,7 @@ pub struct OfflineClient<B, W, S, K> {
 pub struct Client<B, W, S, K> {
     inner: OfflineClient<B, W, S, K>,
     pub server_info: server::Info,
+    fee_estimator: ark_fees::Estimator,
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -496,20 +497,8 @@ where
         timeout_op(self.timeout, self.network_client.connect())
             .await
             .context("Failed to connect to Ark server")??;
-        let server_info = timeout_op(self.timeout, self.network_client.get_info())
-            .await
-            .context("Failed to get Ark server info")??;
 
-        tracing::debug!(
-            name = self.name,
-            ark_server_url = ?self.network_client,
-            "Connected to Ark server"
-        );
-
-        Ok(Client {
-            inner: self,
-            server_info,
-        })
+        self.finish_connect().await
     }
 
     /// Connects to the Ark server and retrieves server information.
@@ -543,6 +532,10 @@ where
             };
         }
 
+        self.finish_connect().await
+    }
+
+    async fn finish_connect(mut self) -> Result<Client<B, W, S, K>, Error> {
         let server_info = timeout_op(self.timeout, self.network_client.get_info())
             .await
             .context("Failed to get Ark server info")??;
@@ -553,13 +546,32 @@ where
             "Connected to Ark server"
         );
 
+        let fee_estimator_config = server_info
+            .fees
+            .clone()
+            .map(|fees| ark_fees::Config {
+                intent_offchain_input_program: fees.intent_fee.offchain_input.unwrap_or_default(),
+                intent_onchain_input_program: fees.intent_fee.onchain_input.unwrap_or_default(),
+                intent_offchain_output_program: fees.intent_fee.offchain_output.unwrap_or_default(),
+                intent_onchain_output_program: fees.intent_fee.onchain_output.unwrap_or_default(),
+            })
+            .unwrap_or_default();
+
+        let fee_estimator =
+            ark_fees::Estimator::new(fee_estimator_config).map_err(Error::ark_server)?;
+
         let client = Client {
             inner: self,
             server_info,
+            fee_estimator,
         };
 
         if let Err(error) = client.discover_keys(DEFAULT_GAP_LIMIT).await {
             tracing::warn!(?error, "Failed during key discovery");
+        };
+
+        if let Err(error) = client.continue_pending_offchain_txs().await {
+            tracing::warn!(?error, "Failed to recover pending transactions");
         };
 
         Ok(client)
@@ -676,9 +688,9 @@ where
             }
 
             // Query all addresses in batch at once
-            let vtxo_list = self
-                .list_vtxos_for_addresses(batch.iter().map(|(_, _, a)| a).copied())
-                .await?;
+            let addresses = batch.iter().map(|(_, _, a)| *a);
+
+            let vtxo_list = self.list_vtxos_for_addresses(addresses).await?;
 
             // Build set of used scripts from response
             let used_scripts: HashSet<&ScriptBuf> = vtxo_list.all().map(|v| &v.script).collect();

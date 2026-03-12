@@ -1,5 +1,6 @@
 [workspace]
 members = [
+  "ark-fees",
   "ark-client",
   "ark-core",
   "ark-grpc",
@@ -7,7 +8,6 @@ members = [
   "ark-bdk-wallet",
   "e2e-tests",
   "ark-client-sample",
-  "ark-rust-secp256k1",
   "ark-rs",
 ]
 
@@ -16,6 +16,7 @@ resolver = "2"
 [workspace.package]
 license = "MIT"
 edition = "2021"
+repository = "https://github.com/arkade-os/rust-sdk"
 
 [workspace.lints.rust]
 unused-import-braces = "warn"

@@ -1,5 +1,6 @@
 use crate::Error;
 use crate::ErrorContext;
+use crate::VTXO_CONDITION_KEY;
 use crate::VTXO_TAPROOT_KEY;
 use bitcoin::absolute;
 use bitcoin::base64;
@@ -29,9 +30,8 @@ use bitcoin::TxOut;
 use bitcoin::Txid;
 use bitcoin::Witness;
 use bitcoin::XOnlyPublicKey;
+use serde::Deserialize;
 use serde::Serialize;
-use std::time::SystemTime;
-use std::time::UNIX_EPOCH;
 
 #[derive(Clone, Debug)]
 pub struct Input {
@@ -47,6 +47,9 @@ pub struct Input {
     spend_info: (ScriptBuf, taproot::ControlBlock),
     is_onchain: bool,
     is_swept: bool,
+    /// Extra witness elements for spending (e.g., preimage for ArkNotes).
+    /// When set, these are used instead of generating a signature.
+    extra_witness: Option<Vec<Vec<u8>>>,
 }
 
 impl Input {
@@ -69,6 +72,32 @@ impl Input {
             spend_info,
             is_onchain,
             is_swept,
+            extra_witness: None,
+        }
+    }
+
+    /// Create an input with extra witness elements (e.g., for ArkNotes).
+    pub fn new_with_extra_witness(
+        outpoint: OutPoint,
+        sequence: Sequence,
+        locktime: Option<absolute::LockTime>,
+        witness_utxo: TxOut,
+        tapscripts: Vec<ScriptBuf>,
+        spend_info: (ScriptBuf, taproot::ControlBlock),
+        is_onchain: bool,
+        is_swept: bool,
+        extra_witness: Vec<Vec<u8>>,
+    ) -> Self {
+        Self {
+            outpoint,
+            sequence,
+            locktime: locktime.unwrap_or(absolute::LockTime::ZERO),
+            witness_utxo,
+            tapscripts,
+            spend_info,
+            is_onchain,
+            is_swept,
+            extra_witness: Some(extra_witness),
         }
     }
 
@@ -94,6 +123,10 @@ impl Input {
 
     pub fn is_swept(&self) -> bool {
         self.is_swept
+    }
+
+    pub fn extra_witness(&self) -> Option<&[Vec<u8>]> {
+        self.extra_witness.as_deref()
     }
 }
 
@@ -137,8 +170,7 @@ pub fn make_intent<SV, SO>(
     sign_for_onchain_fn: SO,
     inputs: Vec<Input>,
     outputs: Vec<Output>,
-    own_cosigner_pks: Vec<PublicKey>,
-    intent_message_type: IntentMessageType,
+    message: IntentMessage,
 ) -> Result<Intent, Error>
 where
     SV: Fn(
@@ -150,30 +182,7 @@ where
         secp256k1::Message,
     ) -> Result<(schnorr::Signature, XOnlyPublicKey), Error>,
 {
-    let mut onchain_output_indexes = Vec::new();
-    for (i, output) in outputs.iter().enumerate() {
-        if matches!(output, Output::Onchain(_)) {
-            onchain_output_indexes.push(i);
-        }
-    }
-
-    let now = SystemTime::now();
-    let now = now
-        .duration_since(UNIX_EPOCH)
-        .map_err(Error::ad_hoc)
-        .context("failed to compute now timestamp")?;
-    let now = now.as_secs();
-    let expire_at = now + (2 * 60);
-
-    let intent_message = IntentMessage {
-        intent_message_type,
-        onchain_output_indexes,
-        valid_at: now,
-        expire_at,
-        own_cosigner_pks,
-    };
-
-    let (mut proof_psbt, fake_input) = build_proof_psbt(&intent_message, &inputs, &outputs)?;
+    let (mut proof_psbt, fake_input) = build_proof_psbt(&message, &inputs, &outputs)?;
 
     for (i, proof_input) in proof_psbt.inputs.iter_mut().enumerate() {
         if i == 0 {
@@ -232,23 +241,38 @@ where
 
         let msg = secp256k1::Message::from_digest(tap_sighash.to_raw_hash().to_byte_array());
 
-        let sigs = match input.is_onchain {
-            true => vec![sign_for_onchain_fn(proof_input, msg)?],
-            false => sign_for_vtxo_fn(proof_input, msg)?,
-        };
-
-        for (sig, pk) in sigs {
-            let sig = taproot::Signature {
-                signature: sig,
-                sighash_type: TapSighashType::Default,
+        // Check if this input has extra witness (e.g., preimage for ArkNotes)
+        if let Some(extra_witness) = input.extra_witness() {
+            // Encode the witness elements and add to PSBT unknown field.
+            // Format: [num_elements] [len1] [elem1] [len2] [elem2] ...
+            let encoded = encode_witness(extra_witness);
+            proof_input.unknown.insert(
+                psbt::raw::Key {
+                    type_value: 222,
+                    key: VTXO_CONDITION_KEY.to_vec(),
+                },
+                encoded,
+            );
+        } else {
+            // Normal signing flow
+            let sigs = match input.is_onchain {
+                true => vec![sign_for_onchain_fn(proof_input, msg)?],
+                false => sign_for_vtxo_fn(proof_input, msg)?,
             };
-            proof_input.tap_script_sigs.insert((pk, leaf_hash), sig);
+
+            for (sig, pk) in sigs {
+                let sig = taproot::Signature {
+                    signature: sig,
+                    sighash_type: TapSighashType::Default,
+                };
+                proof_input.tap_script_sigs.insert((pk, leaf_hash), sig);
+            }
         }
     }
 
     Ok(Intent {
         proof: proof_psbt,
-        message: intent_message,
+        message,
     })
 }
 
@@ -382,53 +406,71 @@ fn message_hash(message: &[u8]) -> sha256::Hash {
     sha256::Hash::hash(&v)
 }
 
-#[derive(Serialize, Debug, Clone)]
-pub struct IntentMessage {
-    #[serde(rename = "type")]
-    intent_message_type: IntentMessageType,
-    // Indicates which outputs are on-chain out of all the outputs we are registering.
-    onchain_output_indexes: Vec<usize>,
-    // The time when this intent message is valid from.
-    valid_at: u64,
-    // The time when this intent message is no longer valid.
-    expire_at: u64,
-    #[serde(rename = "cosigners_public_keys")]
-    own_cosigner_pks: Vec<PublicKey>,
-}
-
-impl IntentMessage {
-    pub(crate) fn new(
-        intent_message_type: IntentMessageType,
+#[derive(Serialize, Deserialize, Debug, Clone)]
+#[serde(tag = "type")]
+pub enum IntentMessage {
+    #[serde(rename = "register")]
+    Register {
         onchain_output_indexes: Vec<usize>,
         valid_at: u64,
         expire_at: u64,
+        #[serde(rename = "cosigners_public_keys")]
         own_cosigner_pks: Vec<PublicKey>,
-    ) -> Self {
-        Self {
-            intent_message_type,
-            onchain_output_indexes,
-            valid_at,
-            expire_at,
-            own_cosigner_pks,
-        }
-    }
+    },
+    #[serde(rename = "delete")]
+    Delete { expire_at: u64 },
+    #[serde(rename = "estimate-intent-fee")]
+    EstimateIntentFee {
+        onchain_output_indexes: Vec<usize>,
+        valid_at: u64,
+        expire_at: u64,
+        #[serde(rename = "cosigners_public_keys")]
+        own_cosigner_pks: Vec<PublicKey>,
+    },
+    #[serde(rename = "get-pending-tx")]
+    GetPendingTx { expire_at: u64 },
+}
 
+impl IntentMessage {
     pub fn encode(&self) -> Result<String, Error> {
-        // TODO: Probably should get rid of `serde` and `serde_json` if we serialize manually.
         serde_json::to_string(self)
             .map_err(Error::ad_hoc)
             .context("failed to serialize intent message to JSON")
     }
 }
 
-#[derive(Serialize, Debug, Clone)]
-pub enum IntentMessageType {
-    #[serde(rename = "register")]
-    Register,
-    #[serde(rename = "delete")]
-    Delete,
-    #[serde(rename = "estimate-intent-fee")]
-    EstimateIntentFee,
+/// Encode witness elements in the format used by PSBT condition witness field.
+///
+/// Format: [num_elements as varint] [len1 as varint] [elem1] [len2 as varint] [elem2] ...
+fn encode_witness(elements: &[Vec<u8>]) -> Vec<u8> {
+    let mut result = Vec::new();
+
+    // Write number of elements as compact size
+    write_compact_size(&mut result, elements.len() as u64);
+
+    // Write each element with its length prefix
+    for elem in elements {
+        write_compact_size(&mut result, elem.len() as u64);
+        result.extend_from_slice(elem);
+    }
+
+    result
+}
+
+/// Write a compact size uint (Bitcoin's variable-length integer encoding).
+fn write_compact_size(w: &mut Vec<u8>, val: u64) {
+    if val < 253 {
+        w.push(val as u8);
+    } else if val < 0x10000 {
+        w.push(253);
+        w.extend_from_slice(&(val as u16).to_le_bytes());
+    } else if val < 0x100000000 {
+        w.push(254);
+        w.extend_from_slice(&(val as u32).to_le_bytes());
+    } else {
+        w.push(255);
+        w.extend_from_slice(&val.to_le_bytes());
+    }
 }
 
 pub(crate) mod taptree {
@@ -556,5 +598,70 @@ pub(crate) mod taptree {
             let decoded = TapTree::decode(&encoded).unwrap();
             assert_eq!(decoded.0, scripts);
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::str::FromStr;
+
+    #[test]
+    fn intent_message_register_serialization() {
+        let pk = PublicKey::from_str(
+            "027b763fdd0d6d96d1ce6fb95e09e381fdae2bcbe3ed7d1a2bd95702524d5dcd8a",
+        )
+        .unwrap();
+        let msg = IntentMessage::Register {
+            onchain_output_indexes: vec![],
+            valid_at: 1762861934,
+            expire_at: 1762862054,
+            own_cosigner_pks: vec![pk],
+        };
+        let encoded = msg.encode().unwrap();
+        assert_eq!(
+            encoded,
+            r#"{"type":"register","onchain_output_indexes":[],"valid_at":1762861934,"expire_at":1762862054,"cosigners_public_keys":["027b763fdd0d6d96d1ce6fb95e09e381fdae2bcbe3ed7d1a2bd95702524d5dcd8a"]}"#
+        );
+    }
+
+    #[test]
+    fn intent_message_estimate_fee_serialization() {
+        let pk = PublicKey::from_str(
+            "027b763fdd0d6d96d1ce6fb95e09e381fdae2bcbe3ed7d1a2bd95702524d5dcd8a",
+        )
+        .unwrap();
+        let msg = IntentMessage::EstimateIntentFee {
+            onchain_output_indexes: vec![],
+            valid_at: 1762861934,
+            expire_at: 1762862054,
+            own_cosigner_pks: vec![pk],
+        };
+        let encoded = msg.encode().unwrap();
+        assert_eq!(
+            encoded,
+            r#"{"type":"estimate-intent-fee","onchain_output_indexes":[],"valid_at":1762861934,"expire_at":1762862054,"cosigners_public_keys":["027b763fdd0d6d96d1ce6fb95e09e381fdae2bcbe3ed7d1a2bd95702524d5dcd8a"]}"#
+        );
+    }
+
+    #[test]
+    fn intent_message_delete_serialization() {
+        let msg = IntentMessage::Delete {
+            expire_at: 1762862054,
+        };
+        let encoded = msg.encode().unwrap();
+        assert_eq!(encoded, r#"{"type":"delete","expire_at":1762862054}"#);
+    }
+
+    #[test]
+    fn intent_message_get_pending_tx_serialization() {
+        let msg = IntentMessage::GetPendingTx {
+            expire_at: 1762862054,
+        };
+        let encoded = msg.encode().unwrap();
+        assert_eq!(
+            encoded,
+            r#"{"type":"get-pending-tx","expire_at":1762862054}"#
+        );
     }
 }

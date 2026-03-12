@@ -918,6 +918,43 @@ where
         })
     }
 
+    /// Generate a BOLT11 invoice using a provided SHA256 preimage hash and a provided public key for a reverse submarine
+    /// swap via Boltz. This allows receiving Lightning payments when the preimage is managed
+    /// externally.
+    ///
+    /// # Arguments
+    ///
+    /// - `amount`: the expected [`Amount`] to be received.
+    /// - `preimage_hash_sha256`: the SHA256 hash of the preimage. The preimage itself is not stored
+    ///   and must be provided later when claiming via [`Self::claim_vhtlc`].
+    /// - `claim_public_key`: the public key which can claim the VHTLC eventually
+    ///
+    /// # Returns
+    ///
+    /// - A [`ReverseSwapResult`], including an identifier for the reverse swap and the
+    ///   [`Bolt11Invoice`] to be paid.
+    ///
+    /// # Note
+    ///
+    /// After calling this method, use [`Self::wait_for_vhtlc_funding`] to wait for the VHTLC to
+    /// be funded. Given an external claim_public_key was provided, the user cannot use
+    /// [`Self::claim_vhtlc`] but needs to claim it outside of this sdk .
+    pub async fn get_ln_invoice_from_hash_with_claim_public_key(
+        &self,
+        amount: SwapAmount,
+        expiry_secs: Option<u64>,
+        preimage_hash_sha256: sha256::Hash,
+        claim_public_key: PublicKey,
+    ) -> Result<ReverseSwapResult, Error> {
+        self.create_reverse_swap_invoice(
+            amount,
+            expiry_secs,
+            preimage_hash_sha256,
+            claim_public_key,
+        )
+        .await
+    }
+
     /// Generate a BOLT11 invoice using a provided SHA256 preimage hash for a reverse submarine
     /// swap via Boltz. This allows receiving Lightning payments when the preimage is managed
     /// externally.
@@ -943,10 +980,26 @@ where
         expiry_secs: Option<u64>,
         preimage_hash_sha256: sha256::Hash,
     ) -> Result<ReverseSwapResult, Error> {
-        let preimage_hash = ripemd160::Hash::hash(preimage_hash_sha256.as_byte_array());
-
         let keypair = self.next_keypair(crate::key_provider::KeypairIndex::New)?;
-        let claim_public_key = keypair.public_key();
+        let claim_public_key = keypair.public_key().into();
+
+        self.create_reverse_swap_invoice(
+            amount,
+            expiry_secs,
+            preimage_hash_sha256,
+            claim_public_key,
+        )
+        .await
+    }
+
+    async fn create_reverse_swap_invoice(
+        &self,
+        amount: SwapAmount,
+        expiry_secs: Option<u64>,
+        preimage_hash_sha256: sha256::Hash,
+        claim_public_key: PublicKey,
+    ) -> Result<ReverseSwapResult, Error> {
+        let preimage_hash = ripemd160::Hash::hash(preimage_hash_sha256.as_byte_array());
 
         let (invoice_amount, onchain_amount) = match amount {
             SwapAmount::Invoice(amount) => (Some(amount), None),
